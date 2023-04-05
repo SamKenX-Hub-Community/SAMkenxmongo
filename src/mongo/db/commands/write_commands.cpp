@@ -68,6 +68,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/transaction/retryable_writes_stats.h"
 #include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
@@ -286,7 +287,8 @@ public:
             if (request().getEncryptionInformation().has_value()) {
                 // Flag set here and in fle_crud.cpp since this only executes on a mongod.
                 CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
-                if (!request().getEncryptionInformation()->getCrudProcessed()) {
+
+                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
                     write_ops::InsertCommandReply insertReply;
                     auto batch = processFLEInsert(opCtx, request(), &insertReply);
                     if (batch == FLEBatchResult::kProcessed) {
@@ -551,12 +553,17 @@ public:
             UpdateRequest updateRequest(request().getUpdates()[0]);
             updateRequest.setNamespaceString(request().getNamespace());
             if (shouldDoFLERewrite(request())) {
-                updateRequest.setQuery(
-                    processFLEWriteExplainD(opCtx,
-                                            write_ops::collationOf(request().getUpdates()[0]),
-                                            request(),
-                                            updateRequest.getQuery()));
+                CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+
+                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                    updateRequest.setQuery(
+                        processFLEWriteExplainD(opCtx,
+                                                write_ops::collationOf(request().getUpdates()[0]),
+                                                request(),
+                                                updateRequest.getQuery()));
+                }
             }
+
             updateRequest.setLegacyRuntimeConstants(request().getLegacyRuntimeConstants().value_or(
                 Variables::generateRuntimeConstants(opCtx)));
             updateRequest.setLetParameters(request().getLet());
@@ -660,7 +667,10 @@ public:
             if (request().getEncryptionInformation().has_value()) {
                 // Flag set here and in fle_crud.cpp since this only executes on a mongod.
                 CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
-                return processFLEDelete(opCtx, request());
+
+                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                    return processFLEDelete(opCtx, request());
+                }
             }
 
             if (isTimeseries(opCtx, request())) {
@@ -712,30 +722,64 @@ public:
                     request().getDeletes().size() == 1);
 
             auto deleteRequest = DeleteRequest{};
-            deleteRequest.setNsString(request().getNamespace());
+            auto isRequestToTimeseries = isTimeseries(opCtx, request());
+            auto nss = [&] {
+                auto nss = request().getNamespace();
+                if (!isRequestToTimeseries) {
+                    return nss;
+                }
+                return nss.isTimeseriesBucketsCollection() ? nss
+                                                           : nss.makeTimeseriesBucketsNamespace();
+            }();
+            deleteRequest.setNsString(nss);
             deleteRequest.setLegacyRuntimeConstants(request().getLegacyRuntimeConstants().value_or(
                 Variables::generateRuntimeConstants(opCtx)));
             deleteRequest.setLet(request().getLet());
 
-            BSONObj query = request().getDeletes()[0].getQ();
+            const auto& firstDelete = request().getDeletes()[0];
+            BSONObj query = firstDelete.getQ();
             if (shouldDoFLERewrite(request())) {
-                query = processFLEWriteExplainD(
-                    opCtx, write_ops::collationOf(request().getDeletes()[0]), request(), query);
+                CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+
+                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                    query = processFLEWriteExplainD(
+                        opCtx, write_ops::collationOf(firstDelete), request(), query);
+                }
             }
             deleteRequest.setQuery(std::move(query));
 
             deleteRequest.setCollation(write_ops::collationOf(request().getDeletes()[0]));
-            deleteRequest.setMulti(request().getDeletes()[0].getMulti());
+            deleteRequest.setMulti(firstDelete.getMulti());
             deleteRequest.setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
-            deleteRequest.setHint(request().getDeletes()[0].getHint());
+            deleteRequest.setHint(firstDelete.getHint());
             deleteRequest.setIsExplain(true);
-
-            ParsedDelete parsedDelete(opCtx, &deleteRequest);
-            uassertStatusOK(parsedDelete.parseRequest());
 
             // Explains of write commands are read-only, but we take write locks so that timing
             // info is more accurate.
-            AutoGetCollection collection(opCtx, request().getNamespace(), MODE_IX);
+            AutoGetCollection collection(opCtx, deleteRequest.getNsString(), MODE_IX);
+
+            if (isRequestToTimeseries) {
+                uassert(ErrorCodes::NamespaceNotFound,
+                        "Could not find time-series buckets collection for write explain",
+                        *collection);
+                auto timeseriesOptions = collection->getTimeseriesOptions();
+                uassert(ErrorCodes::InvalidOptions,
+                        "Time-series buckets collection is missing time-series options",
+                        timeseriesOptions);
+
+                if (timeseries::isHintIndexKey(firstDelete.getHint())) {
+                    deleteRequest.setHint(
+                        uassertStatusOK(timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
+                            *timeseriesOptions, firstDelete.getHint())));
+                }
+            }
+
+            ParsedDelete parsedDelete(opCtx,
+                                      &deleteRequest,
+                                      isRequestToTimeseries && collection
+                                          ? collection->getTimeseriesOptions()
+                                          : boost::none);
+            uassertStatusOK(parsedDelete.parseRequest());
 
             // Explain the plan tree.
             auto exec = uassertStatusOK(getExecutorDelete(&CurOp::get(opCtx)->debug(),

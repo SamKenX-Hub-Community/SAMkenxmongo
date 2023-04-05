@@ -111,18 +111,18 @@ class DocumentSource;
  * parser and enforce the 'sometimes' behavior during that invocation. No extra validation will be
  * done here.
  */
-#define REGISTER_EXPRESSION_WITH_FEATURE_FLAG(                                               \
-    key, parser, allowedWithApiStrict, allowedClientType, featureFlag)                       \
-    MONGO_INITIALIZER_GENERAL(addToExpressionParserMap_##key,                                \
-                              ("BeginExpressionRegistration"),                               \
-                              ("EndExpressionRegistration"))                                 \
-    (InitializerContext*) {                                                                  \
-        if (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                      \
-            !boost::optional<FeatureFlag>(featureFlag)->isEnabledAndIgnoreFCV()) {           \
-            return;                                                                          \
-        }                                                                                    \
-        Expression::registerExpression(                                                      \
-            "$" #key, (parser), (allowedWithApiStrict), (allowedClientType), (featureFlag)); \
+#define REGISTER_EXPRESSION_WITH_FEATURE_FLAG(                                                    \
+    key, parser, allowedWithApiStrict, allowedClientType, featureFlag)                            \
+    MONGO_INITIALIZER_GENERAL(addToExpressionParserMap_##key,                                     \
+                              ("BeginExpressionRegistration"),                                    \
+                              ("EndExpressionRegistration"))                                      \
+    (InitializerContext*) {                                                                       \
+        if (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                           \
+            !boost::optional<FeatureFlag>(featureFlag)->isEnabledAndIgnoreFCVUnsafeAtStartup()) { \
+            return;                                                                               \
+        }                                                                                         \
+        Expression::registerExpression(                                                           \
+            "$" #key, (parser), (allowedWithApiStrict), (allowedClientType), (featureFlag));      \
     }
 
 /**
@@ -160,7 +160,8 @@ class DocumentSource;
     (InitializerContext*) {                                                                  \
         if (!__VA_ARGS__ ||                                                                  \
             (boost::optional<FeatureFlag>(featureFlag) != boost::none &&                     \
-             !boost::optional<FeatureFlag>(featureFlag)->isEnabledAndIgnoreFCV())) {         \
+             !boost::optional<FeatureFlag>(featureFlag)                                      \
+                  ->isEnabledAndIgnoreFCVUnsafeAtStartup())) {                               \
             return;                                                                          \
         }                                                                                    \
         Expression::registerExpression(                                                      \
@@ -1207,7 +1208,8 @@ class ExpressionObjectToArray final : public ExpressionFixedArity<ExpressionObje
 public:
     explicit ExpressionObjectToArray(ExpressionContext* const expCtx)
         : ExpressionFixedArity<ExpressionObjectToArray, 1>(expCtx) {
-        expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
+        expCtx->sbeCompatibility =
+            std::min(expCtx->sbeCompatibility, SbeCompatibility::flagGuarded);
     }
 
     Value evaluate(const Document& root, Variables* variables) const final;
@@ -1226,7 +1228,8 @@ class ExpressionArrayToObject final : public ExpressionFixedArity<ExpressionArra
 public:
     explicit ExpressionArrayToObject(ExpressionContext* const expCtx)
         : ExpressionFixedArity<ExpressionArrayToObject, 1>(expCtx) {
-        expCtx->sbeCompatibility = SbeCompatibility::notCompatible;
+        expCtx->sbeCompatibility =
+            std::min(expCtx->sbeCompatibility, SbeCompatibility::flagGuarded);
     }
 
     ExpressionArrayToObject(ExpressionContext* const expCtx, ExpressionVector&& children)
@@ -2354,13 +2357,6 @@ public:
 
 class ExpressionInternalFLEEqual final : public Expression {
 public:
-    // TODO: SERVER-73303 delete constructor when v2 is enabled by default
-    ExpressionInternalFLEEqual(ExpressionContext* expCtx,
-                               boost::intrusive_ptr<Expression> field,
-                               ConstDataRange serverToken,
-                               int64_t contentionFactor,
-                               ConstDataRange edcToken);
-
     ExpressionInternalFLEEqual(ExpressionContext* expCtx,
                                boost::intrusive_ptr<Expression> field,
                                ServerZerosEncryptionToken zerosToken);
@@ -2383,19 +2379,11 @@ public:
     }
 
 private:
-    EncryptedPredicateEvaluator _evaluator;
     EncryptedPredicateEvaluatorV2 _evaluatorV2;
 };
 
 class ExpressionInternalFLEBetween final : public Expression {
 public:
-    // TODO: SERVER-73303 delete constructor when v2 is enabled by default
-    ExpressionInternalFLEBetween(ExpressionContext* expCtx,
-                                 boost::intrusive_ptr<Expression> field,
-                                 ConstDataRange serverToken,
-                                 int64_t contentionFactor,
-                                 std::vector<ConstDataRange> edcTokens);
-
     ExpressionInternalFLEBetween(ExpressionContext* expCtx,
                                  boost::intrusive_ptr<Expression> field,
                                  std::vector<ServerZerosEncryptionToken> serverTokens);
@@ -2418,7 +2406,6 @@ public:
     }
 
 private:
-    EncryptedPredicateEvaluator _evaluator;
     EncryptedPredicateEvaluatorV2 _evaluatorV2;
 };
 

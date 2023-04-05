@@ -55,10 +55,24 @@ TimeseriesModifyStage::TimeseriesModifyStage(ExpressionContext* expCtx,
             "multi is true and no residual predicate was specified",
             _isDeleteOne() || _residualPredicate);
     _children.emplace_back(std::move(child));
+
+    // These three properties are only used for the queryPlanner explain and will not change while
+    // executing this stage.
+    _specificStats.opType = [&] {
+        if (_isDeleteOne()) {
+            return "deleteOne";
+        } else {
+            return "deleteMany";
+        }
+    }();
+    _specificStats.bucketFilter = _params->canonicalQuery->getQueryObj();
+    if (_residualPredicate) {
+        _specificStats.residualFilter = _residualPredicate->serialize();
+    }
 }
 
 bool TimeseriesModifyStage::isEOF() {
-    if (_isDeleteOne() && _specificStats.measurementsDeleted > 0) {
+    if (_isDeleteOne() && _specificStats.nMeasurementsDeleted > 0) {
         return true;
     }
     return child()->isEOF() && _retryBucketId == WorkingSet::INVALID_ID;
@@ -80,7 +94,7 @@ PlanStage::StageState TimeseriesModifyStage::_writeToTimeseriesBuckets(
     const std::vector<BSONObj>& deletedMeasurements,
     bool bucketFromMigrate) {
     if (_params->isExplain) {
-        _specificStats.measurementsDeleted += deletedMeasurements.size();
+        _specificStats.nMeasurementsDeleted += deletedMeasurements.size();
         return PlanStage::NEED_TIME;
     }
 
@@ -118,8 +132,8 @@ PlanStage::StageState TimeseriesModifyStage::_writeToTimeseriesBuckets(
         write_ops::DeleteOpEntry deleteEntry(BSON("_id" << bucketId), false);
         write_ops::DeleteCommandRequest op(collection()->ns(), {deleteEntry});
 
-        auto result =
-            timeseries::performAtomicWrites(opCtx(), collection(), recordId, op, bucketFromMigrate);
+        auto result = timeseries::performAtomicWrites(
+            opCtx(), collection(), recordId, op, bucketFromMigrate, _params->stmtId);
         if (!result.isOK()) {
             return yieldAndRetry(7309300);
         }
@@ -145,13 +159,13 @@ PlanStage::StageState TimeseriesModifyStage::_writeToTimeseriesBuckets(
         write_ops::UpdateOpEntry updateEntry(BSON("_id" << bucketId), std::move(u));
         write_ops::UpdateCommandRequest op(collection()->ns(), {updateEntry});
 
-        auto result =
-            timeseries::performAtomicWrites(opCtx(), collection(), recordId, op, bucketFromMigrate);
+        auto result = timeseries::performAtomicWrites(
+            opCtx(), collection(), recordId, op, bucketFromMigrate, _params->stmtId);
         if (!result.isOK()) {
             return yieldAndRetry(7309301);
         }
     }
-    _specificStats.measurementsDeleted += deletedMeasurements.size();
+    _specificStats.nMeasurementsDeleted += deletedMeasurements.size();
 
     // As restoreState may restore (recreate) cursors, cursors are tied to the
     // transaction in which they are created, and a WriteUnitOfWork is a transaction,
@@ -286,7 +300,7 @@ PlanStage::StageState TimeseriesModifyStage::doWork(WorkingSetID* out) {
         // This bucket is closed, skip it.
         return PlanStage::NEED_TIME;
     }
-    ++_specificStats.bucketsUnpacked;
+    ++_specificStats.nBucketsUnpacked;
 
     std::vector<BSONObj> unchangedMeasurements;
     std::vector<BSONObj> deletedMeasurements;

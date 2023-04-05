@@ -508,7 +508,7 @@ let testCases = {
     getMore: {skip: "does not accept read or write concern"},
     getParameter: {skip: "does not accept read or write concern"},
     getQueryableEncryptionCountInfo: {
-        // TODO SERVER-69563 - Enable this test once the feature flag is enabled
+        // TODO SERVER-75631 - Enable this test once the feature flag is gone
         skip: "requires feature flag"
         // setUp: function(conn) {
         //     assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));

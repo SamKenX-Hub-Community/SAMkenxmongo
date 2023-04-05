@@ -148,7 +148,8 @@ Pipeline::SourceContainer::iterator DocumentSourceChangeStreamOplogMatch::doOpti
     tassert(5687203, "Iterator mismatch during optimization", *itr == this);
 
     auto nextChangeStreamStageItr = std::next(itr);
-    if (!feature_flags::gFeatureFlagChangeStreamsRewrite.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag doesn't have upgrade/downgrade concern.
+    if (!feature_flags::gFeatureFlagChangeStreamsRewrite.isEnabledAndIgnoreFCVUnsafe()) {
         return nextChangeStreamStageItr;
     }
 
@@ -214,7 +215,7 @@ Value DocumentSourceChangeStreamOplogMatch::serialize(SerializationOptions opts)
         sub.done();
     } else {
         BSONObjBuilder sub(builder.subobjStart(kStageName));
-        if (opts.replacementForLiteralArgs || opts.redactFieldNames) {
+        if (opts.replacementForLiteralArgs || opts.redactIdentifiers) {
             sub.append(DocumentSourceChangeStreamOplogMatchSpec::kFilterFieldName,
                        getMatchExpression()->serialize(opts));
         } else {

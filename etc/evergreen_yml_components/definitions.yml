@@ -2205,6 +2205,25 @@ functions:
     params:
       file_location: ${report_file|src/report.json}
 
+  "combine build metrics":
+    - command: subprocess.exec
+      params:
+        binary: bash
+        add_expansions_to_env: true
+        args:
+        - "src/evergreen/run_python_script.sh"
+        - "site_scons/site_tools/build_metrics/combine_metrics_unittest.py"
+    - command: subprocess.exec
+      params:
+        binary: bash
+        add_expansions_to_env: true
+        args:
+        - "src/evergreen/run_python_script.sh"
+        - "site_scons/site_tools/build_metrics/combine_metrics.py"
+        - "--prefix-name=build_metrics"
+        - "--prefix-name=populate_cache"
+        - "--prefix-name=pull_cache"
+
   "print top N metrics":
     - command: subprocess.exec
       params:
@@ -5449,12 +5468,11 @@ tasks:
     vars:
       resmoke_jobs_max: 1
 
-- <<: *task_template
-  name: sharded_collections_jscore_passthrough
+- <<: *gen_task_template
+  name: sharded_collections_jscore_passthrough_gen
   tags: ["sharding", "jscore"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
 
 - <<: *task_template
   name: sharded_collections_jscore_passthrough_with_catalog_shard
@@ -6949,6 +6967,14 @@ tasks:
   tags: []
   commands:
   - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: resmoke_validation_tests
+  tags: []
+  depends_on: []
+  commands:
+  - func: "do non-compile setup"
   - func: "run tests"
 
 - name: test_packages

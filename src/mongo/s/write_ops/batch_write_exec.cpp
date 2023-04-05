@@ -135,7 +135,10 @@ std::vector<AsyncRequestsSender::Request> constructARSRequestsToSend(
         stats->noteTargetedShard(targetShardId);
 
         const auto request = [&] {
-            const auto shardBatchRequest(batchOp.buildBatchRequest(*nextBatch, targeter));
+            const auto shardBatchRequest(batchOp.buildBatchRequest(
+                *nextBatch,
+                targeter,
+                boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */));
 
             BSONObjBuilder requestBuilder;
             shardBatchRequest.serialize(&requestBuilder);
@@ -400,7 +403,14 @@ void executeTwoPhaseWrite(OperationContext* opCtx,
         return childBatches.begin()->second.get();
     }();
 
-    auto cmdObj = batchOp.buildBatchRequest(*targetedWriteBatch, targeter).toBSON();
+    auto allowShardKeyUpdatesWithoutFullShardKeyInQuery =
+        opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction();
+
+    auto cmdObj = batchOp
+                      .buildBatchRequest(*targetedWriteBatch,
+                                         targeter,
+                                         allowShardKeyUpdatesWithoutFullShardKeyInQuery)
+                      .toBSON();
 
     auto swRes = write_without_shard_key::runTwoPhaseWriteProtocol(
         opCtx, clientRequest.getNS(), std::move(cmdObj));
@@ -561,6 +571,10 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                 targetStatus.getValue()) {
                 tassert(
                     6992000, "Executing write batches with a size of 0", childBatches.size() > 0u);
+
+                uassert(7545800,
+                        "Cannot perform time-series singleton writes without a shard key",
+                        !targeter.isShardedTimeSeriesBucketsNamespace());
 
                 // Execute the two phase write protocol for writes that cannot directly target a
                 // shard. If there are any transaction errors, 'abortBatch' will be set.

@@ -34,6 +34,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 
@@ -88,9 +89,10 @@ public:
              const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        // (Ignore FCV check): TODO(SERVER-75389): add why FCV is ignored here.
         uassert(7368402,
                 "The transition to catalog shard feature is disabled",
-                gFeatureFlagTransitionToCatalogShard.isEnabledAndIgnoreFCV());
+                gFeatureFlagTransitionToCatalogShard.isEnabledAndIgnoreFCVUnsafe());
         uassert(7467203,
                 "The catalog shard feature is disabled",
                 gFeatureFlagCatalogShard.isEnabled(serverGlobalParams.featureCompatibility));
@@ -100,22 +102,39 @@ public:
                 serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
+        ON_BLOCK_EXIT([&opCtx] {
+            try {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
+                // This can throw if the opCtx was interrupted. Catch to prevent crashing.
+            }
+        });
+
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
         auto shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
-        const std::string shardName = shardingState->shardId().toString();
+        const auto shardId = shardingState->shardId();
 
-        DBDirectClient client(opCtx);
-        BSONObj response;
+        const auto shardingCatalogManager = ShardingCatalogManager::get(opCtx);
 
-        // Need to append w: majority because removeShard commands requires it.
-        auto removeShardCmd = CommandHelpers::appendMajorityWriteConcern(
-            BSON("_configsvrRemoveShard" << shardName), opCtx->getWriteConcern());
-        client.runCommand(DatabaseName{"admin"}, removeShardCmd, response);
+        const auto shardDrainingStatus = [&] {
+            try {
+                return shardingCatalogManager->removeShard(opCtx, shardId);
+            } catch (const DBException& ex) {
+                LOGV2(7470500,
+                      "Failed to remove shard",
+                      "shardId"_attr = shardId,
+                      "error"_attr = redact(ex));
+                throw;
+            }
+        }();
 
-        uassertStatusOK(getStatusFromCommandResult(response));
-        uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
-
-        CommandHelpers::filterCommandReplyForPassthrough(response, &result);
+        shardingCatalogManager->appendShardDrainingStatus(
+            opCtx, result, shardDrainingStatus, shardId);
 
         return true;
     }

@@ -47,6 +47,7 @@ enums:
            advanceClusterTime :  "advanceClusterTime"
            allCollectionStats: "allCollectionStats"
            analyze :  "analyze"
+           analyzeShardKey : "analyzeShardKey"
            anyAction :  "anyAction"         # Special ActionType that represents *all* actions
            appendOplogNote :  "appendOplogNote"
            applicationMessage :  "applicationMessage"
@@ -71,6 +72,7 @@ enums:
            collStats :  "collStats"
            compact :  "compact"
            compactStructuredEncryptionData: "compactStructuredEncryptionData"
+           configureQueryAnalyzer : "configureQueryAnalyzer"
            connPoolStats :  "connPoolStats"
            connPoolSync :  "connPoolSync"
            convertToCapped :  "convertToCapped"
@@ -121,6 +123,7 @@ enums:
            insert :  "insert"
            internal :  "internal"  # Special action type that represents internal actions
            invalidateUserCache :  "invalidateUserCache"
+           issueDirectShardOperations: "issueDirectShardOperations"
            killAnyCursor :  "killAnyCursor"
            killAnySession :  "killAnySession"
            killCursors :  "killCursors"  # Deprecated in favor of killAnyCursor
@@ -130,6 +133,7 @@ enums:
            listCursors :  "listCursors"
            listDatabases :  "listDatabases"
            listIndexes :  "listIndexes"
+           listSampledQueries : "listSampledQueries"
            listSearchIndexes : "listSearchIndexes"
            listSessions :  "listSessions"
            listShards :  "listShards"
@@ -290,6 +294,7 @@ enums:
                         - collStats
                         - compact
                         - compactStructuredEncryptionData
+                        - configureQueryAnalyzer # TODO (SERVER-75656): remove from serverlessActionTypes.
                         - convertToCapped
                         - createCollection
                         - createIndex
@@ -362,6 +367,7 @@ enums:
                         - collStats
                         - compact
                         - compactStructuredEncryptionData
+                        - configureQueryAnalyzer # TODO (SERVER-75656): remove from serverlessActionTypes.
                         - convertToCapped
                         - createCollection
                         - createIndex

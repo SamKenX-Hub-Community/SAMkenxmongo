@@ -8,6 +8,7 @@ selector:
     # Skip any tests that run with auth explicitly.
     # Auth tests require authentication on the stepdown thread's connection
   - jstests/sharding/*[aA]uth*.js
+  - jstests/sharding/analyze_shard_key/*[aA]uth*.js
   - jstests/sharding/query/*[aA]uth*.js
   - jstests/sharding/change_streams/*[aA]uth*.js
   - jstests/sharding/internal_txns/internal_client_restrictions.js
@@ -83,6 +84,7 @@ selector:
   - jstests/sharding/move_primary_fails_without_database_version.js
   # Calls the config server primary directly (not through mongos)
   - jstests/sharding/analyze_shard_key/configure_query_analyzer_basic.js
+  - jstests/sharding/analyze_shard_key/invalid_config_docs.js
   - jstests/sharding/analyze_shard_key/persist_sampled_diffs.js
   - jstests/sharding/analyze_shard_key/persist_sampled_read_queries.js
   - jstests/sharding/analyze_shard_key/persist_sampled_write_queries.js

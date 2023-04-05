@@ -176,19 +176,6 @@ bool isAnyNssAViewOrSharded(OperationContext* opCtx,
     });
 }
 
-std::vector<NamespaceString> resolveNamespaceStringOrUUIDs(
-    OperationContext* opCtx,
-    const CollectionCatalog* catalog,
-    const std::vector<NamespaceStringOrUUID>& nssOrUUIDs) {
-    std::vector<NamespaceString> resolvedNamespaces;
-    resolvedNamespaces.reserve(nssOrUUIDs.size());
-    for (auto&& nssOrUUID : nssOrUUIDs) {
-        auto nss = catalog->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
-        resolvedNamespaces.emplace_back(nss);
-    }
-    return resolvedNamespaces;
-}
-
 void assertAllNamespacesAreCompatibleForReadTimestamp(
     OperationContext* opCtx,
     const CollectionCatalog* catalog,
@@ -215,8 +202,12 @@ boost::optional<std::vector<NamespaceString>> resolveSecondaryNamespacesOrUUIDs(
     OperationContext* opCtx,
     const CollectionCatalog* catalog,
     const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs) {
-
-    auto resolvedNamespaces = resolveNamespaceStringOrUUIDs(opCtx, catalog, secondaryNssOrUUIDs);
+    std::vector<NamespaceString> resolvedNamespaces;
+    resolvedNamespaces.reserve(secondaryNssOrUUIDs.size());
+    for (auto&& nssOrUUID : secondaryNssOrUUIDs) {
+        auto nss = catalog->resolveNamespaceStringOrUUID(opCtx, nssOrUUID);
+        resolvedNamespaces.emplace_back(nss);
+    }
 
     auto isAnySecondaryNssShardedOrAView =
         isAnyNssAViewOrSharded(opCtx, catalog, resolvedNamespaces);
@@ -873,7 +864,8 @@ const NamespaceString& AutoGetCollectionForReadPITCatalog::getNss() const {
 AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
                                                    const NamespaceStringOrUUID& nsOrUUID,
                                                    AutoGetCollection::Options options) {
-    if (!feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
+    if (!feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe()) {
         _legacy.emplace(opCtx, nsOrUUID, options);
     } else {
         _pitCatalog.emplace(opCtx, nsOrUUID, options);
@@ -1176,7 +1168,6 @@ getCollectionForLockFreeRead(OperationContext* opCtx,
                              boost::optional<Timestamp> readTimestamp,
                              const NamespaceStringOrUUID& nsOrUUID,
                              AutoGetCollection::Options options) {
-    DatabaseShardingState::assertMatchingDbVersion(opCtx, nsOrUUID.db());
 
     auto& hangBeforeAutoGetCollectionLockFreeShardedStateAccess =
         *globalFailPointRegistry().find("hangBeforeAutoGetCollectionLockFreeShardedStateAccess");
@@ -1315,6 +1306,8 @@ AutoGetCollectionForReadLockFreePITCatalog::AutoGetCollectionForReadLockFreePITC
     invariant(supportsLockFreeRead(opCtx) &&
               (!opCtx->recoveryUnit()->isActive() || _isLockFreeReadSubOperation));
 
+    DatabaseShardingState::assertMatchingDbVersion(opCtx, nsOrUUID.db());
+
     auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     if (_isLockFreeReadSubOperation) {
         // If this instance is nested and lock-free, then we do not want to adjust any setting, but
@@ -1384,7 +1377,8 @@ AutoGetCollectionForReadLockFree::AutoGetCollectionForReadLockFree(
     OperationContext* opCtx,
     const NamespaceStringOrUUID& nsOrUUID,
     AutoGetCollection::Options options) {
-    if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
+    if (feature_flags::gPointInTimeCatalogLookups.isEnabledAndIgnoreFCVUnsafe()) {
         _impl.emplace<AutoGetCollectionForReadLockFreePITCatalog>(
             opCtx, nsOrUUID, std::move(options));
     } else {

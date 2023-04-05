@@ -74,6 +74,7 @@
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 #include "mongo/db/s/shard_authoritative_catalog_gen.h"
+#include "mongo/db/s/sharding_cluster_parameters_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_state.h"
@@ -91,6 +92,8 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/catalog/type_index_catalog.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/exit.h"
@@ -343,7 +346,7 @@ public:
 
             // TODO SERVER-68373: Remove once 7.0 becomes last LTS
             if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) &&
-                gFeatureFlagFLE2ProtocolVersion2.isEnabledOnVersion(requestedVersion)) {
+                mongo::gFeatureFlagFLE2CompactForProtocolV2.isEnabledOnVersion(requestedVersion)) {
                 ShardingDDLCoordinatorService::getService(opCtx)
                     ->waitForCoordinatorsOfGivenTypeToComplete(
                         opCtx,
@@ -455,11 +458,6 @@ public:
 
         if (!request.getPhase() || request.getPhase() == SetFCVPhaseEnum::kPrepare) {
             if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
-                if (gFeatureFlagCatalogShard.isEnabledAndIgnoreFCV()) {
-                    // The config server may also be a shard, so have it run any shard server tasks.
-                    _shardServerPhase1Tasks(opCtx, requestedVersion);
-                }
-
                 uassert(ErrorCodes::Error(6794600),
                         "Failing downgrade due to "
                         "'failBeforeSendingShardsToDowngradingOrUpgrading' failpoint set",
@@ -467,6 +465,15 @@ public:
                 // Tell the shards to enter 'start' phase of setFCV (transition to kDowngrading).
                 _sendSetFCVRequestToShards(
                     opCtx, request, changeTimestamp, SetFCVPhaseEnum::kStart);
+
+                // (Ignore FCV check): This feature flag is intentional to only check if it is
+                // enabled on this binary so the config server can be a shard.
+                if (gFeatureFlagCatalogShard.isEnabledAndIgnoreFCVUnsafe()) {
+                    // The config server may also be a shard, so have it run any shard server tasks.
+                    // Run this after sending the first phase to shards so they enter the transition
+                    // state even if this throws.
+                    _shardServerPhase1Tasks(opCtx, requestedVersion);
+                }
             }
 
             // Any checks and actions that need to be performed before being able to downgrade needs
@@ -552,8 +559,8 @@ public:
         // TODO SERVER-68373: Remove once 7.0 becomes last LTS
         if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) &&
             requestedVersion > actualVersion &&
-            gFeatureFlagFLE2ProtocolVersion2.isEnabledOnTargetFCVButDisabledOnOriginalFCV(
-                requestedVersion, actualVersion)) {
+            mongo::gFeatureFlagFLE2CompactForProtocolV2
+                .isEnabledOnTargetFCVButDisabledOnOriginalFCV(requestedVersion, actualVersion)) {
             ShardingDDLCoordinatorService::getService(opCtx)
                 ->waitForCoordinatorsOfGivenTypeToComplete(
                     opCtx, DDLCoordinatorTypeEnum::kCompactStructuredEncryptionDataPre70Compatible);
@@ -632,8 +639,8 @@ private:
 
         // TODO SERVER-68373 remove once 7.0 becomes last LTS
         if (isDowngrading &&
-            gFeatureFlagFLE2ProtocolVersion2.isDisabledOnTargetFCVButEnabledOnOriginalFCV(
-                requestedVersion, originalVersion)) {
+            mongo::gFeatureFlagFLE2CompactForProtocolV2
+                .isDisabledOnTargetFCVButEnabledOnOriginalFCV(requestedVersion, originalVersion)) {
             // Drain the QE compact coordinator because it persists state that is
             // not backwards compatible with earlier versions.
             ShardingDDLCoordinatorService::getService(opCtx)
@@ -690,6 +697,7 @@ private:
             // Depends on _setOnCurrentShardSinceFieldOnChunks()
             _initializePlacementHistory(opCtx, requestedVersion, actualVersion);
             _dropConfigMigrationsCollection(opCtx);
+            _setShardedClusterCardinalityParam(opCtx, requestedVersion);
         }
 
         _removeRecordPreImagesCollectionOption(opCtx);
@@ -801,6 +809,47 @@ private:
                 requestedVersion, actualVersion)) {
             LOGV2(6885200, "Creating schema on config.settings");
             uassertStatusOK(ShardingCatalogManager::get(opCtx)->upgradeConfigSettings(opCtx));
+        }
+    }
+
+    void _setShardedClusterCardinalityParam(
+        OperationContext* opCtx, const multiversion::FeatureCompatibilityVersion requestedVersion) {
+        if (feature_flags::gClusterCardinalityParameter.isEnabledOnVersion(requestedVersion)) {
+            // Get current cluster parameter value so that we don't run SetClusterParameter
+            // extraneously
+            auto* clusterParameters = ServerParameterSet::getClusterParameterSet();
+            auto* clusterCardinalityParam =
+                clusterParameters->get<ClusterParameterWithStorage<ShardedClusterCardinalityParam>>(
+                    "shardedClusterCardinalityForDirectConns");
+            auto currentValue =
+                clusterCardinalityParam->getValue(boost::none).getHasTwoOrMoreShards();
+
+            // config.shards is stable during FCV changes, so query that to discover the current
+            // number of shards.
+            DBDirectClient client(opCtx);
+            FindCommandRequest findRequest{NamespaceString::kConfigsvrShardsNamespace};
+            findRequest.setLimit(2);
+            auto numShards = client.find(std::move(findRequest))->itcount();
+            bool expectedValue = numShards >= 2;
+
+            if (expectedValue == currentValue) {
+                return;
+            }
+
+            ConfigsvrSetClusterParameter configsvrSetClusterParameter(
+                BSON("shardedClusterCardinalityForDirectConns"
+                     << BSON("hasTwoOrMoreShards" << expectedValue)));
+            configsvrSetClusterParameter.setDbName(DatabaseName(boost::none, "admin"));
+
+            const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+            const auto cmdResponse =
+                uassertStatusOK(shardRegistry->getConfigShard()->runCommandWithFixedRetryAttempts(
+                    opCtx,
+                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                    DatabaseName::kAdmin.toString(),
+                    configsvrSetClusterParameter.toBSON({}),
+                    Shard::RetryPolicy::kIdempotent));
+            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
         }
     }
 
@@ -1388,7 +1437,9 @@ private:
         // Set the isCleaningServerMetadata field to true. This prohibits the downgrading to
         // upgrading transition until the isCleaningServerMetadata is unset when we successfully
         // finish the FCV downgrade and transition to the DOWNGRADED state.
-        if (repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCV()) {
+        // (Ignore FCV check): This is intentional because we want to use this feature even if we
+        // are in downgrading fcv state.
+        if (repl::feature_flags::gDowngradingToUpgrading.isEnabledAndIgnoreFCVUnsafe()) {
             {
                 const auto fcvChangeRegion(
                     FeatureCompatibilityVersion::enterFCVChangeRegion(opCtx));

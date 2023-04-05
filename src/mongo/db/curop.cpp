@@ -427,6 +427,18 @@ void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
 
 static constexpr size_t appendMaxElementSize = 50 * 1024;
 
+bool shouldOmitDiagnosticInformation(CurOp* curop) {
+    do {
+        if (curop->debug().shouldOmitDiagnosticInformation) {
+            return true;
+        }
+
+        curop = curop->parent();
+    } while (curop != nullptr);
+
+    return false;
+}
+
 bool CurOp::completeAndLogOperation(logv2::LogComponent component,
                                     std::shared_ptr<const ProfileFilter> filter,
                                     boost::optional<size_t> responseLength,
@@ -446,6 +458,11 @@ bool CurOp::completeAndLogOperation(logv2::LogComponent component,
         duration_cast<Microseconds>(elapsedTimeExcludingPauses());
     const auto executionTimeMillis =
         durationCount<Milliseconds>(*_debug.additiveMetrics.executionTime);
+
+    // Do not log the slow query information if asked to omit it
+    if (shouldOmitDiagnosticInformation(this)) {
+        return false;
+    }
 
     if (_debug.isReplOplogGetMore) {
         oplogGetMoreStats.recordMillis(executionTimeMillis);
@@ -752,7 +769,11 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
         builder->append("dataThroughputAverage", *_debug.dataThroughputAverage);
     }
 
-    if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage engine
+    // initialization and FCV checking is ignored there, so here we also need to ignore FCV to keep
+    // consistent behavior.
+    if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations
+            .isEnabledAndIgnoreFCVUnsafe()) {
         auto admissionPriority = opCtx->lockState()->getAdmissionPriority();
         if (admissionPriority < AdmissionContext::Priority::kNormal) {
             builder->append("admissionPriority", toString(admissionPriority));
@@ -976,7 +997,11 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("reslen", responseLength);
     }
 
-    if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag is used to initialize ticketing during storage engine
+    // initialization and FCV checking is ignored there, so here we also need to ignore FCV to keep
+    // consistent behavior.
+    if (feature_flags::gFeatureFlagDeprioritizeLowPriorityOperations
+            .isEnabledAndIgnoreFCVUnsafe()) {
         auto admissionPriority = opCtx->lockState()->getAdmissionPriority();
         if (admissionPriority < AdmissionContext::Priority::kNormal) {
             pAttrs->add("admissionPriority", admissionPriority);

@@ -84,9 +84,13 @@ void removeDatabaseFromConfigAndUpdatePlacementHistory(
         Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName);
     });
 
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
+
     auto txnClient = std::make_unique<txn_api::details::SEPTransactionClient>(
         opCtx,
-        executor,
+        inlineExecutor,
+        sleepInlineExecutor,
         std::make_unique<txn_api::details::ClusterSEPTransactionClientBehaviors>(
             opCtx->getServiceContext()));
     /*
@@ -141,11 +145,15 @@ void removeDatabaseFromConfigAndUpdatePlacementHistory(
             .semi();
     };
 
-    txn_api::SyncTransactionWithRetries txn(
-        opCtx, executor, nullptr /*resourceYielder*/, std::move(txnClient));
+    txn_api::SyncTransactionWithRetries txn(opCtx,
+                                            sleepInlineExecutor,
+                                            nullptr /*resourceYielder*/,
+                                            inlineExecutor,
+                                            std::move(txnClient));
     txn.run(opCtx, transactionChain);
 }
 
+// TODO SERVER-73627: Remove once 7.0 becomes last LTS
 class ScopedDatabaseCriticalSection {
 public:
     ScopedDatabaseCriticalSection(OperationContext* opCtx,
@@ -173,6 +181,9 @@ public:
             DatabaseShardingState::assertDbLockedAndAcquireExclusive(_opCtx, databaseName);
         scopedDss->exitCriticalSection(_opCtx, _reason);
     }
+
+    ScopedDatabaseCriticalSection(const ScopedDatabaseCriticalSection&) = delete;
+    ScopedDatabaseCriticalSection(ScopedDatabaseCriticalSection&&) = delete;
 
 private:
     OperationContext* _opCtx;
@@ -342,7 +353,7 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                 // ensure we do not delete collections of a different DB
                 if (!_firstExecution &&
                     isDbAlreadyDropped(opCtx, _doc.getDatabaseVersion(), _dbName)) {
-                    if (!_isPre70Compatible()) {
+                    if (_isPre70Compatible()) {
                         // Clear the database sharding state so that all subsequent write operations
                         // with the old database version will fail due to StaleDbVersion.
                         // Note: because we are using an scoped critical section it could happen
@@ -410,8 +421,7 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                             _critSecReason,
                             ShardingCatalogClient::kLocalWriteConcern);
                     } else {
-                        scopedCritSec.emplace(ScopedDatabaseCriticalSection(
-                            opCtx, _dbName.toString(), _critSecReason));
+                        scopedCritSec.emplace(opCtx, _dbName.toString(), _critSecReason);
                     }
 
                     auto dropDatabaseParticipantCmd = ShardsvrDropDatabaseParticipant();

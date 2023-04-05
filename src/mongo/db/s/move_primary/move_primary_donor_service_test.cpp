@@ -833,8 +833,10 @@ TEST_F(MovePrimaryDonorServiceTest, StateDocumentRemovedAfterSuccess) {
 
 TEST_F(MovePrimaryDonorServiceTest, ReadyToBlockWritesPromiseReturnsErrorIfAborted) {
     auto opCtx = makeOperationContext();
-    auto instance = createInstance(opCtx.get());
+    auto [instance, fp] =
+        createInstanceInState(opCtx.get(), MovePrimaryDonorStateEnum::kInitializing);
     instance->abort(kAbortedError);
+    fp->setMode(FailPoint::off);
     ASSERT_EQ(instance->getReadyToBlockWritesFuture().getNoThrow(), kAbortedError);
 }
 
@@ -950,6 +952,18 @@ TEST_F(MovePrimaryDonorServiceTest, ExplicitAbortAfterDecisionSetOk) {
     ASSERT_EQ(instance->getCompletionFuture().getNoThrow(), kAbortedError);
     assertSentRecipientAbortCommand();
 }
+
+TEST_F(MovePrimaryDonorServiceTest, AbortDuringPartialStateTransitionMaintainsAbortReason) {
+    auto opCtx = makeOperationContext();
+    auto [fp, count] = pauseStateTransition(kPartial, MovePrimaryDonorStateEnum::kInitializing);
+    auto instance = createInstance(opCtx.get());
+    fp->waitForTimesEntered(count + 1);
+    instance->abort(kAbortedError);
+    fp->setMode(FailPoint::off);
+    instance->onReadyToForget();
+    ASSERT_EQ(instance->getCompletionFuture().getNoThrow(), kAbortedError);
+}
+
 
 }  // namespace
 }  // namespace mongo

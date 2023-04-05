@@ -150,7 +150,7 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     ::mongo::getTestCommandsEnabled() ? AllowedWithClientType::kAny
                                       : AllowedWithClientType::kInternal,
     feature_flags::gFeatureFlagBucketUnpackWithSort,
-    feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV());
+    feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCVUnsafeAtStartup());
 
 DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeek() {
     if (_timeSorterNextDoc) {
@@ -284,7 +284,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceSort::clone(
 void DocumentSourceSort::serializeToArray(std::vector<Value>& array,
                                           SerializationOptions opts) const {
     auto explain = opts.verbosity;
-    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+    if (opts.redactIdentifiers || opts.replacementForLiteralArgs) {
         MONGO_UNIMPLEMENTED_TASSERT(7484310);
     }
 

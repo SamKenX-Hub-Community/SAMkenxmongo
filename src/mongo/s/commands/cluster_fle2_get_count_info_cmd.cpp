@@ -62,6 +62,10 @@ public:
         return true;
     }
 
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {GetQueryableEncryptionCountInfo::kTokensFieldName};
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -96,9 +100,7 @@ public:
 ClusterGetQueryableEncryptionCountInfoCmd::Reply
 ClusterGetQueryableEncryptionCountInfoCmd::Invocation::typedRun(OperationContext* opCtx) {
 
-    uassert(741502,
-            "FeatureFlagFLE2ProtocolVersion2 is not enabled",
-            gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility));
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
 
     auto nss = request().getNamespace();
     const auto dbInfo =

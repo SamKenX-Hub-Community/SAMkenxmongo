@@ -50,6 +50,7 @@
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/s/config/index_on_config.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/vector_clock.h"
@@ -1055,10 +1056,12 @@ BSONObj ShardingCatalogManager::findOneConfigDocument(OperationContext* opCtx,
 void ShardingCatalogManager::withTransactionAPI(OperationContext* opCtx,
                                                 const NamespaceString& namespaceForInitialFind,
                                                 txn_api::Callback callback) {
-    auto txn =
-        txn_api::SyncTransactionWithRetries(opCtx,
-                                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                                            nullptr /* resourceYielder */);
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(
+        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor());
+
+    auto txn = txn_api::SyncTransactionWithRetries(
+        opCtx, sleepInlineExecutor, nullptr /* resourceYielder */, inlineExecutor);
     txn.run(opCtx,
             [innerCallback = std::move(callback),
              namespaceForInitialFind](const txn_api::TransactionClient& txnClient,
@@ -1309,10 +1312,34 @@ void ShardingCatalogManager::initializePlacementHistory(OperationContext* opCtx)
     opCtx->setWriteConcern(WriteConcernOptions{WriteConcernOptions::kMajority,
                                                WriteConcernOptions::SyncMode::UNSET,
                                                WriteConcernOptions::kNoTimeout});
+
     ScopeGuard resetWriteConcerGuard([opCtx, &originalWC] { opCtx->setWriteConcern(originalWC); });
+
     auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
-    txn_api::SyncTransactionWithRetries txn(opCtx, executor, nullptr /*resourceYielder*/);
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
+
+    txn_api::SyncTransactionWithRetries txn(
+        opCtx, sleepInlineExecutor, nullptr /*resourceYielder*/, inlineExecutor);
     txn.run(opCtx, transactionChain);
+}
+
+void ShardingCatalogManager::_performLocalNoopWriteWithWAllWriteConcern(OperationContext* opCtx,
+                                                                        StringData msg) {
+    tenant_migration_access_blocker::performNoopWrite(opCtx, msg);
+
+    auto allMembersWriteConcern =
+        WriteConcernOptions(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                            WriteConcernOptions::SyncMode::NONE,
+                            // Defaults to no timeout if none was set.
+                            opCtx->getWriteConcern().wTimeout);
+
+    const auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
+    auto awaitReplicationResult = repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
+        opCtx, replClient.getLastOp(), allMembersWriteConcern);
+    uassertStatusOKWithContext(awaitReplicationResult.status,
+                               str::stream() << "Waiting for replication of noop with message: \""
+                                             << msg << "\" failed");
 }
 
 }  // namespace mongo

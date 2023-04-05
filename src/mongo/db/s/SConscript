@@ -4,28 +4,6 @@ Import("env")
 
 env = env.Clone()
 
-# This library is about to be decommissioned. Use `db/shard_role_api` instead.
-env.Library(
-    target='sharding_api_d_DO_NOT_ADD_MORE_USAGES',
-    source=[
-        'collection_metadata.cpp',
-        'collection_sharding_state_factory_standalone.cpp',
-        'collection_sharding_state.cpp',
-        'global_user_write_block_state.cpp',
-        'sharding_migration_critical_section.cpp',
-        'sharding_statistics.cpp',
-        'sharding_write_router.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/s/grid',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/server_base',
-        '$BUILD_DIR/mongo/db/write_block_bypass',
-    ],
-)
-
 env.Library(
     target='move_primary_shared_data',
     source=[
@@ -312,6 +290,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/remove_saver',
         '$BUILD_DIR/mongo/db/timeseries/bucket_catalog/bucket_catalog',
         '$BUILD_DIR/mongo/db/transaction/transaction_operations',
+        '$BUILD_DIR/mongo/executor/inline_executor',
         '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/util/future_util',
         'balancer_stats_registry',
@@ -443,6 +422,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_aware_service',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/server_feature_flags',
         '$BUILD_DIR/mongo/db/shard_role',
@@ -451,6 +431,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/transaction/transaction',
         '$BUILD_DIR/mongo/db/transaction/transaction_api',
         '$BUILD_DIR/mongo/db/vector_clock_mongod',
+        '$BUILD_DIR/mongo/executor/inline_executor',
         '$BUILD_DIR/mongo/executor/network_interface',
         '$BUILD_DIR/mongo/idl/cluster_server_parameter_common',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
@@ -653,6 +634,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/timeseries/timeseries_conversion_util',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_options',
         '$BUILD_DIR/mongo/db/transaction/transaction_api',
+        '$BUILD_DIR/mongo/executor/inline_executor',
         '$BUILD_DIR/mongo/idl/cluster_server_parameter',
         '$BUILD_DIR/mongo/s/commands/cluster_commands_common',
         '$BUILD_DIR/mongo/s/commands/sharded_cluster_sharding_commands',

@@ -155,10 +155,12 @@ void handleWouldChangeOwningShardErrorNonTransaction(
     const NamespaceString& nss,
     const write_ops::FindAndModifyCommandRequest& request,
     BSONObjBuilder* result) {
-    auto txn =
-        txn_api::SyncTransactionWithRetries(opCtx,
-                                            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-                                            nullptr /* resourceYielder */);
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(
+        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor());
+
+    auto txn = txn_api::SyncTransactionWithRetries(
+        opCtx, sleepInlineExecutor, nullptr /* resourceYielder */, inlineExecutor);
 
     // Shared state for the transaction API use below.
     struct SharedBlock {
@@ -253,10 +255,15 @@ void handleWouldChangeOwningShardErrorTransaction(
         WouldChangeOwningShardInfo::parseFromCommandError(extraInfo), nss);
 
     try {
+        auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+        auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+        auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
+
         auto txn = txn_api::SyncTransactionWithRetries(
             opCtx,
-            Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-            TransactionRouterResourceYielder::makeForLocalHandoff());
+            sleepInlineExecutor,
+            TransactionRouterResourceYielder::makeForLocalHandoff(),
+            inlineExecutor);
 
         txn.run(opCtx,
                 [sharedBlock, fleCrudProcessed](const txn_api::TransactionClient& txnClient,
@@ -318,12 +325,14 @@ void handleWouldChangeOwningShardErrorTransactionLegacy(OperationContext* opCtx,
     }
 }
 
-BSONObj prepareCmdObjForPassthrough(OperationContext* opCtx,
-                                    const BSONObj& cmdObj,
-                                    const NamespaceString& nss,
-                                    bool isExplain,
-                                    const boost::optional<DatabaseVersion>& dbVersion,
-                                    const boost::optional<ShardVersion>& shardVersion) {
+BSONObj prepareCmdObjForPassthrough(
+    OperationContext* opCtx,
+    const BSONObj& cmdObj,
+    const NamespaceString& nss,
+    bool isExplain,
+    const boost::optional<DatabaseVersion>& dbVersion,
+    const boost::optional<ShardVersion>& shardVersion,
+    boost::optional<bool> allowShardKeyUpdatesWithoutFullShardKeyInQuery) {
     BSONObj filteredCmdObj = CommandHelpers::filterCommandRequestForPassthrough(cmdObj);
     if (!isExplain) {
         if (auto sampleId = analyze_shard_key::tryGenerateSampleId(
@@ -347,6 +356,18 @@ BSONObj prepareCmdObjForPassthrough(OperationContext* opCtx,
             bob.append(write_ops::WriteCommandRequestBase::kStmtIdFieldName, 0);
             newCmdObj = bob.obj();
         }
+    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            "$_allowShardKeyUpdatesWithoutFullShardKeyInQuery is an internal parameter",
+            !newCmdObj.hasField(write_ops::FindAndModifyCommandRequest::
+                                    kAllowShardKeyUpdatesWithoutFullShardKeyInQueryFieldName));
+    if (allowShardKeyUpdatesWithoutFullShardKeyInQuery.has_value()) {
+        BSONObjBuilder bob(newCmdObj);
+        bob.appendBool(write_ops::FindAndModifyCommandRequest::
+                           kAllowShardKeyUpdatesWithoutFullShardKeyInQueryFieldName,
+                       *allowShardKeyUpdatesWithoutFullShardKeyInQuery);
+        newCmdObj = bob.obj();
     }
     return newCmdObj;
 }
@@ -401,6 +422,8 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
         auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
             IDLParserContext("ClusterFindAndModify"), request.body);
         if (shouldDoFLERewrite(findAndModifyRequest)) {
+            CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+
             auto newRequest = processFLEFindAndModifyExplainMongos(opCtx, findAndModifyRequest);
             return newRequest.first.toBSON(request.body);
         } else {
@@ -582,11 +605,6 @@ void FindAndModifyCmd::_constructResult(OperationContext* opCtx,
             handleWouldChangeOwningShardError(opCtx, shardId, nss, cmdObj, responseStatus, result);
         } else {
             // TODO SERVER-67429: Remove this branch.
-            uassert(
-                ErrorCodes::IllegalOperation,
-                "Must run update to document shard key in a transaction or as a retryable write. ",
-                txnRouter || isRetryableWrite);
-
             opCtx->setQuerySamplingOptions(QuerySamplingOptions::kOptOut);
 
             if (isRetryableWrite) {
@@ -619,9 +637,17 @@ void FindAndModifyCmd::_runCommandWithoutShardKey(OperationContext* opCtx,
                                                   const BSONObj& cmdObj,
                                                   bool isExplain,
                                                   BSONObjBuilder* result) {
+    auto allowShardKeyUpdatesWithoutFullShardKeyInQuery =
+        opCtx->isRetryableWrite() || opCtx->inMultiDocumentTransaction();
 
-    auto cmdObjForPassthrough = prepareCmdObjForPassthrough(
-        opCtx, cmdObj, nss, isExplain, boost::none /* dbVersion */, boost::none /* shardVersion */);
+    auto cmdObjForPassthrough =
+        prepareCmdObjForPassthrough(opCtx,
+                                    cmdObj,
+                                    nss,
+                                    isExplain,
+                                    boost::none /* dbVersion */,
+                                    boost::none /* shardVersion */,
+                                    allowShardKeyUpdatesWithoutFullShardKeyInQuery);
 
     auto swRes =
         write_without_shard_key::runTwoPhaseWriteProtocol(opCtx, nss, cmdObjForPassthrough);
@@ -674,8 +700,14 @@ void FindAndModifyCmd::_runCommand(OperationContext* opCtx,
 
     const auto response = [&] {
         std::vector<AsyncRequestsSender::Request> requests;
-        auto cmdObjForPassthrough =
-            prepareCmdObjForPassthrough(opCtx, cmdObj, nss, isExplain, dbVersion, shardVersion);
+        auto cmdObjForPassthrough = prepareCmdObjForPassthrough(
+            opCtx,
+            cmdObj,
+            nss,
+            isExplain,
+            dbVersion,
+            shardVersion,
+            boost::none /* allowShardKeyUpdatesWithoutFullShardKeyInQuery */);
         requests.emplace_back(shardId, cmdObjForPassthrough);
 
         MultiStatementTransactionRequestsSender ars(

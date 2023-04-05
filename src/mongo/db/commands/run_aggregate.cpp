@@ -795,19 +795,15 @@ Status runAggregate(OperationContext* opCtx,
             nss = NamespaceString::kRsOplogNamespace;
 
             // In case of serverless the change stream will be opened on the change collection.
-            if (change_stream_serverless_helpers::isChangeCollectionsModeActive()) {
+            const bool changeCollectionsMode =
+                change_stream_serverless_helpers::isChangeCollectionsModeActive();
+            if (changeCollectionsMode) {
                 const auto tenantId =
                     change_stream_serverless_helpers::resolveTenantId(origNss.tenantId());
 
                 uassert(ErrorCodes::BadValue,
                         "Change streams cannot be used without tenant id",
                         tenantId);
-
-                uassert(ErrorCodes::ChangeStreamNotEnabled,
-                        "Change streams must be enabled before being used.",
-                        change_stream_serverless_helpers::isChangeStreamEnabled(opCtx, *tenantId));
-
-
                 nss = NamespaceString::makeChangeCollectionNSS(tenantId);
             }
 
@@ -846,6 +842,11 @@ Status runAggregate(OperationContext* opCtx,
             // Obtain collection locks on the execution namespace; that is, the oplog.
             initContext(auto_get_collection::ViewMode::kViewsForbidden);
             registerTelemetry();
+            uassert(ErrorCodes::ChangeStreamNotEnabled,
+                    "Change streams must be enabled before being used",
+                    !changeCollectionsMode ||
+                        change_stream_serverless_helpers::isChangeStreamEnabled(opCtx,
+                                                                                *nss.tenantId()));
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             uassert(4928901,
                     str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
@@ -1012,10 +1013,13 @@ Status runAggregate(OperationContext* opCtx,
         // support querying against encrypted fields.
         if (shouldDoFLERewrite(request)) {
             CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
-            // After this rewriting, the encryption info does not need to be kept around.
-            pipeline = processFLEPipelineD(
-                opCtx, nss, request.getEncryptionInformation().value(), std::move(pipeline));
-            request.setEncryptionInformation(boost::none);
+
+            if (!request.getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                pipeline = processFLEPipelineD(
+                    opCtx, nss, request.getEncryptionInformation().value(), std::move(pipeline));
+                request.getEncryptionInformation()->setCrudProcessed(true);
+            }
+
             // Set the telemetryStoreKey to none so telemetry isn't collected when we've done a FLE
             // rewrite.
             CurOp::get(opCtx)->debug().telemetryStoreKey = boost::none;

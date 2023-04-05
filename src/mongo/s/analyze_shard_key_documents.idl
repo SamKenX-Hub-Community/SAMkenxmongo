@@ -38,6 +38,7 @@ structs:
   QueryAnalyzerDocument:
     description: "Represents a document storing the query analyzer configuration for a collection
                   as configured via the configureQueryAnalyzer command."
+    strict: false
     fields:
       _id:
         type: uuid
@@ -46,6 +47,13 @@ structs:
       ns:
         type: namespacestring
         description: "The namespace of the collection."
+      startTime:
+        type: date
+        description: "The time at which query sampling began."
+      stopTime:
+        type: date
+        description: "The time at which query sampling ended."
+        optional: true
     inline_chained_structs: true
     chained_structs:
       QueryAnalyzerConfiguration: configuration

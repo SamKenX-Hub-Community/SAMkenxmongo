@@ -501,7 +501,9 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
             "expandWildcardIndexEntry expected only WildcardIndexes",
             wildcardIndex.type == INDEX_WILDCARD);
 
-    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This is intentional because we want clusters which have wildcard indexes
+    // still be able to use the feature even if the FCV is downgraded.
+    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCVUnsafe()) {
         // Should only have one field of the form {"path.$**" : 1}.
         tassert(7246511,
                 "Wildcard Index's key pattern must always have length 1 for non-compound Wildcard "
@@ -531,7 +533,6 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
     const auto& includedPaths =
         wildcardProjection->exhaustivePaths() ? *wildcardProjection->exhaustivePaths() : kEmptySet;
 
-    bool wildcardIndexUsed = false;
     for (auto&& fieldName : projectedFields) {
         auto entry = createExpandedIndexEntry(wildcardIndex, fieldName, includedPaths);
 
@@ -542,16 +543,15 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
                 "'$_path' is reserved fieldname for Wildcard Indexes",
                 "$_path"_sd != fieldName);
         out->push_back(*entry);
-        wildcardIndexUsed = true;
     }
 
     // If this wildcard index cannot be expanded because the wildcard field is not relevant. We
     // should also check whether the regular fields is able to answer the query or not. That is - if
     // any field of the regular fields in a compound wildcard index is in 'fields', then we should
     // also generate an expanded wildcard 'IndexEntry' for later index analysis.
-    if (feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV() &&
-        !wildcardIndexUsed) {
-
+    // (Ignore FCV check): This is intentional because we want clusters which have wildcard indexes
+    // still be able to use the feature even if the FCV is downgraded.
+    if (feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCVUnsafe()) {
         bool shouldExpand = false;
         for (auto elem : wildcardIndex.keyPattern) {
             auto fieldName = elem.fieldNameStringData();
@@ -600,7 +600,9 @@ BoundsTightness translateWildcardIndexBoundsAndTightness(
     // only have a single keyPattern field and multikeyPath entry, but this is sufficient to
     // determine whether it will be necessary to adjust the tightness.
     invariant(index.type == IndexType::INDEX_WILDCARD);
-    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This is intentional because we want clusters which have wildcard indexes
+    // still be able to use the feature even if the FCV is downgraded.
+    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCVUnsafe()) {
         invariant(index.keyPattern.nFields() == 1);
         invariant(index.multikeyPaths.size() == 1);
     }
@@ -652,7 +654,9 @@ void finalizeWildcardIndexScanConfiguration(
 
     // We should only ever reach this point when processing a $** index. Sanity check the arguments.
     invariant(index && index->type == IndexType::INDEX_WILDCARD);
-    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This is intentional because we want clusters which have wildcard indexes
+    // still be able to use the feature even if the FCV is downgraded.
+    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCVUnsafe()) {
         invariant(index->keyPattern.nFields() == 1);
         invariant(index->multikeyPaths.size() == 1);
         invariant(bounds && bounds->fields.size() == 1);
@@ -741,7 +745,9 @@ bool isWildcardObjectSubpathScan(const IndexScanNode* node) {
     }
 
     // We expect consistent arguments, representing a $** index which has already been finalized.
-    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This is intentional because we want clusters which have wildcard indexes
+    // still be able to use the feature even if the FCV is downgraded.
+    if (!feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCVUnsafe()) {
         invariant(node->index.keyPattern.nFields() == 2);
         invariant(node->index.multikeyPaths.size() == 2);
         invariant(node->bounds.fields.size() == 2);

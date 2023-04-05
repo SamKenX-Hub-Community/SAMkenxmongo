@@ -101,9 +101,7 @@ std::vector<QECountInfoReplyTokenSet> toGetTagRequestTupleSet(
 QECountInfosReply getTagsLocal(OperationContext* opCtx,
                                const GetQueryableEncryptionCountInfo& request) {
 
-    uassert(741503,
-            "FeatureFlagFLE2ProtocolVersion2 is not enabled",
-            gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility));
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
 
     auto nestedTokens = toNestedTokens(request.getTokens());
 
@@ -171,6 +169,10 @@ public:
 
     bool allowedInTransactions() const final {
         return true;
+    }
+
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {GetQueryableEncryptionCountInfo::kTokensFieldName};
     }
 } getQueryableEncryptionCountInfoCmd;
 

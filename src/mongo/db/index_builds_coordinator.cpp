@@ -89,8 +89,10 @@ MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeCommit);
 MONGO_FAIL_POINT_DEFINE(hangBeforeBuildingIndex);
 MONGO_FAIL_POINT_DEFINE(hangBeforeBuildingIndexSecond);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeWaitingUntilMajorityOpTime);
+MONGO_FAIL_POINT_DEFINE(hangBeforeUnregisteringAfterCommit);
 MONGO_FAIL_POINT_DEFINE(failSetUpResumeIndexBuild);
 MONGO_FAIL_POINT_DEFINE(failIndexBuildWithError);
+MONGO_FAIL_POINT_DEFINE(hangInRemoveIndexBuildEntryAfterCommitOrAbort);
 
 IndexBuildsCoordinator::IndexBuildsSSS::IndexBuildsSSS()
     : ServerStatusSection("indexBuilds"),
@@ -189,6 +191,8 @@ void removeIndexBuildEntryAfterCommitOrAbort(OperationContext* opCtx,
     if (IndexBuildProtocol::kSinglePhase == replState.protocol) {
         return;
     }
+
+    hangInRemoveIndexBuildEntryAfterCommitOrAbort.pauseWhileSet();
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
@@ -925,20 +929,24 @@ void IndexBuildsCoordinator::abortAllIndexBuildsForInitialSync(OperationContext*
 
 namespace {
 
-// Interrupts the index builder thread and waits for it to clean up.
-void forceSelfAbortIndexBuild(OperationContext* opCtx,
+// Interrupts the index builder thread and waits for it to clean up. Returns true if the index was
+// aborted, and false if it was already committed or aborted.
+bool forceSelfAbortIndexBuild(OperationContext* opCtx,
                               std::shared_ptr<ReplIndexBuildState>& replState,
                               Status reason) {
-    if (replState->forceSelfAbort(opCtx, reason)) {
-        auto fut = replState->sharedPromise.getFuture();
-        auto waitStatus = fut.waitNoThrow();              // Result from waiting on future.
-        auto buildStatus = fut.getNoThrow().getStatus();  // Result from _runIndexBuildInner().
-        LOGV2(7419401,
-              "Index build: joined after forceful abort",
-              "buildUUID"_attr = replState->buildUUID,
-              "waitResult"_attr = waitStatus,
-              "status"_attr = buildStatus);
+    if (!replState->forceSelfAbort(opCtx, reason)) {
+        return false;
     }
+
+    auto fut = replState->sharedPromise.getFuture();
+    auto waitStatus = fut.waitNoThrow();              // Result from waiting on future.
+    auto buildStatus = fut.getNoThrow().getStatus();  // Result from _runIndexBuildInner().
+    LOGV2(7419401,
+          "Index build: joined after forceful abort",
+          "buildUUID"_attr = replState->buildUUID,
+          "waitResult"_attr = waitStatus,
+          "status"_attr = buildStatus);
+    return true;
 }
 
 }  // namespace
@@ -959,8 +967,10 @@ void IndexBuildsCoordinator::abortAllIndexBuildsDueToDiskSpace(OperationContext*
                            requiredBytes));
     for (auto&& replState : builds) {
         // Signals the index build to abort iself, which may involve signalling the current primary.
-        forceSelfAbortIndexBuild(opCtx, replState, abortStatus);
-        indexBuildsSSS.killedDueToInsufficentDiskSpace.addAndFetch(1);
+        if (forceSelfAbortIndexBuild(opCtx, replState, abortStatus)) {
+            // Increase metrics only if the build was actually aborted by the above call.
+            indexBuildsSSS.killedDueToInsufficientDiskSpace.addAndFetch(1);
+        }
     }
 }
 
@@ -1595,23 +1605,6 @@ void IndexBuildsCoordinator::onStepUp(OperationContext* opCtx) {
     // with FCV 4.2, and then upgraded FCV 4.4.
     indexbuildentryhelpers::ensureIndexBuildEntriesNamespaceExists(opCtx);
 
-    auto indexBuilds = _getIndexBuilds();
-    auto onIndexBuild = [this, opCtx](const std::shared_ptr<ReplIndexBuildState>& replState) {
-        if (IndexBuildProtocol::kTwoPhase != replState->protocol) {
-            return;
-        }
-
-        if (!_signalIfCommitQuorumNotEnabled(opCtx, replState)) {
-            // This reads from system.indexBuilds collection to see if commit quorum got satisfied.
-            try {
-                _signalIfCommitQuorumIsSatisfied(opCtx, replState);
-            } catch (DBException& ex) {
-                fassert(31440, ex.toStatus());
-            }
-        }
-    };
-    forEachIndexBuild(indexBuilds, "IndexBuildsCoordinator::onStepUp"_sd, onIndexBuild);
-
     if (_stepUpThread.joinable()) {
         // Under normal circumstances this should not result in a wait. The thread's opCtx should
         // be interrupted on replication state change, or finish while being primary. If this
@@ -1639,27 +1632,45 @@ void IndexBuildsCoordinator::onStepUp(OperationContext* opCtx) {
 
 void IndexBuildsCoordinator::_onStepUpAsyncTaskFn(OperationContext* opCtx) {
     auto indexBuilds = _getIndexBuilds();
-    const auto retrySkippedRecords = [this, opCtx](
-                                         const std::shared_ptr<ReplIndexBuildState>& replState) {
-        if (replState->protocol == IndexBuildProtocol::kTwoPhase) {
-            try {
-                // We don't need to check if we are primary because the opCtx is interrupted at
-                // stepdown, so it is guaranteed that if taking the locks succeeds, we are primary.
-                // Take an intent lock, the actual index build should keep running in parallel.
-                const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
-                AutoGetCollection autoColl(opCtx, dbAndUUID, MODE_IX);
+    const auto signalCommitQuorumAndRetrySkippedRecords =
+        [this, opCtx](const std::shared_ptr<ReplIndexBuildState>& replState) {
+            if (replState->protocol != IndexBuildProtocol::kTwoPhase) {
+                return;
+            }
 
-                // The index build might have committed or aborted while looping and not holding the
-                // collection lock. Re-check it is still active after taking locks.
-                auto indexBuilds = activeIndexBuilds.filterIndexBuilds(
-                    [&replState](const ReplIndexBuildState& filterState) {
-                        return filterState.buildUUID == replState->buildUUID;
-                    });
+            // We don't need to check if we are primary because the opCtx is interrupted at
+            // stepdown, so it is guaranteed that if taking the locks succeeds, we are primary.
+            // Take an intent lock, the actual index build should keep running in parallel.
+            // This also prevents the concurrent index build from aborting or committing
+            // while we check if the commit quorum has to be signaled or check the skipped records.
+            const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
+            AutoGetCollection autoColl(opCtx, dbAndUUID, MODE_IX);
 
-                if (indexBuilds.empty()) {
-                    return;
+            // The index build might have committed or aborted while looping and not holding the
+            // collection lock. Re-checking if it is still active after taking locks would not solve
+            // the issue, as build can still be registered as active, even if it is in an aborted or
+            // committed state.
+            if (replState->isAborting() || replState->isAborted() || replState->isCommitted()) {
+                return;
+            }
+
+            if (!_signalIfCommitQuorumNotEnabled(opCtx, replState)) {
+                // This reads from system.indexBuilds collection to see if commit quorum got
+                // satisfied.
+                try {
+                    if (_signalIfCommitQuorumIsSatisfied(opCtx, replState)) {
+                        // The index build has been signalled to commit. As retrying skipped records
+                        // during step-up is done to prevent waiting until commit time, if the build
+                        // has already been signalled to commit, we may skip the retry during
+                        // step-up.
+                        return;
+                    }
+                } catch (DBException& ex) {
+                    fassert(31440, ex.toStatus());
                 }
+            }
 
+            try {
                 // Only checks if key generation is valid, does not actually insert.
                 uassertStatusOK(_indexBuildsManager.retrySkippedRecords(
                     opCtx,
@@ -1679,18 +1690,19 @@ void IndexBuildsCoordinator::_onStepUpAsyncTaskFn(OperationContext* opCtx) {
                 abortIndexBuildByBuildUUID(
                     opCtx, replState->buildUUID, IndexBuildAction::kPrimaryAbort, status.reason());
             }
-        }
-    };
+        };
 
     try {
-        forEachIndexBuild(
-            indexBuilds, "IndexBuildsCoordinator::_onStepUpAsyncTaskFn"_sd, retrySkippedRecords);
+        forEachIndexBuild(indexBuilds,
+                          "IndexBuildsCoordinator::_onStepUpAsyncTaskFn"_sd,
+                          signalCommitQuorumAndRetrySkippedRecords);
     } catch (const DBException& ex) {
         LOGV2_DEBUG(7333100,
                     1,
                     "Step-up retry of skipped records for all index builds interrupted",
                     "exception"_attr = ex);
     }
+    LOGV2(7508300, "Finished performing asynchronous step-up checks on index builds");
 }
 
 IndexBuilds IndexBuildsCoordinator::stopIndexBuildsForRollback(OperationContext* opCtx) {
@@ -2044,7 +2056,8 @@ void IndexBuildsCoordinator::verifyNoIndexBuilds_forTestOnly() const {
 // static
 void IndexBuildsCoordinator::updateCurOpOpDescription(OperationContext* opCtx,
                                                       const NamespaceString& nss,
-                                                      const std::vector<BSONObj>& indexSpecs) {
+                                                      const std::vector<BSONObj>& indexSpecs,
+                                                      boost::optional<BSONObj> curOpDesc) {
     BSONObjBuilder builder;
 
     // If the collection namespace is provided, add a 'createIndexes' field with the collection name
@@ -2064,7 +2077,7 @@ void IndexBuildsCoordinator::updateCurOpOpDescription(OperationContext* opCtx,
 
     stdx::unique_lock<Client> lk(*opCtx->getClient());
     auto curOp = CurOp::get(opCtx);
-    builder.appendElementsUnique(curOp->opDescription());
+    builder.appendElementsUnique(curOpDesc ? curOpDesc.value() : curOp->opDescription());
     auto opDescObj = builder.obj();
     curOp->setLogicalOp_inlock(LogicalOp::opCommand);
     curOp->setOpDescription_inlock(opDescObj);
@@ -2483,6 +2496,7 @@ void IndexBuildsCoordinator::_runIndexBuild(
     // Ensure the index build is unregistered from the Coordinator and the Promise is set with
     // the build's result so that callers are notified of the outcome.
     if (status.isOK()) {
+        hangBeforeUnregisteringAfterCommit.pauseWhileSet();
         // Unregister first so that when we fulfill the future, the build is not observed as active.
         activeIndexBuilds.unregisterIndexBuild(&_indexBuildsManager, replState);
         replState->sharedPromise.emplaceValue(replState->stats);
@@ -2576,7 +2590,8 @@ void IndexBuildsCoordinator::_cleanUpTwoPhaseAfterNonShutdownFailure(
     // vote, because we want the voting itself to be killable. Continue and try to abort as primary
     // or crash.
     if (!opCtx->isKillPending() &&
-        feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCV()) {
+        // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
+        feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCVUnsafe()) {
         if (ErrorCodes::NotWritablePrimary == status && !replState->isAbortCleanUpRequired()) {
             // Clean up if the error happens due to stepdown before 'startIndexBuild' oplog entry is
             // replicated. Other nodes will not be aware of this index build, so trying to signal
@@ -2595,7 +2610,8 @@ void IndexBuildsCoordinator::_cleanUpTwoPhaseAfterNonShutdownFailure(
             // The index builder thread will need to reach out to the current primary to abort on
             // its own. This can happen if an error is thrown, it is interrupted by a user killop,
             // or is killed internally by something like the DiskSpaceMonitor.
-            if (feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCV()) {
+            // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
+            if (feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCVUnsafe()) {
                 // If we were interrupted by a caller internally who set a status, use that
                 // status instead of the generic interruption error status.
                 auto abortStatus =
@@ -2736,7 +2752,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // feature flag is enabled, two-phase builds can handle unexpected errors by requesting an abort
     // to the primary node. Single-phase builds can also abort immediately, as the primary or
     // standalone is the only node aware of the build.
-    if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCV()) {
+    // (Ignore FCV check): This feature flag doesn't have any upgrade/downgrade concerns.
+    if (!feature_flags::gIndexBuildGracefulErrorHandling.isEnabledAndIgnoreFCVUnsafe()) {
         // Index builds only check index constraints when committing. If an error occurs at that
         // point, then the build is cleaned up while still holding the appropriate locks. The only
         // errors that we cannot anticipate are user interrupts and shutdown errors.
@@ -3003,10 +3020,6 @@ CollectionPtr IndexBuildsCoordinator::_setUpForScanCollectionAndInsertSortedKeys
         CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, replState->collectionUUID));
     invariant(collection);
     collection.makeYieldable(opCtx, LockedCollectionYieldRestore(opCtx, collection));
-
-    // Set up the thread's currentOp information to display createIndexes cmd information.
-    updateCurOpOpDescription(opCtx, collection->ns(), replState->indexSpecs);
-
     return collection;
 }
 

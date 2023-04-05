@@ -152,6 +152,11 @@ const ASN1OID mongodbRolesOID("1.3.6.1.4.1.34601.2.1.1",
                               "MongoRoles",
                               "Sequence of MongoDB Database Roles");
 
+const ASN1OID mongodbClusterMembershipOID(
+    "1.3.6.1.4.1.34601.2.1.2",
+    "MongoDBClusterMembership",
+    "String name identifying the cluster this certificate is a member of");
+
 /**
  * Counts of negogtiated version used by TLS connections.
  */
@@ -411,6 +416,11 @@ extern bool isSSLServer;
 bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName);
 
 /**
+ * Parse a UTF8 string from a DER encoded ASN.1 DisplayString.
+ */
+StatusWith<std::string> parseDERString(ConstDataRange cdr);
+
+/**
  * Parse a binary blob of DER encoded ASN.1 into a set of RoleNames.
  */
 StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExtension);
@@ -434,6 +444,14 @@ std::string removeFQDNRoot(std::string name);
  * See "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
  */
 std::string escapeRfc2253(StringData str);
+
+/**
+ * Generates a new SSLX509Name containing only the attributes requested in filteredAttributes.
+ * Note that multi-valued RDNs will be preserved if any of the attributes in the RDN are specified
+ * in filteredAttributes.
+ */
+SSLX509Name filterClusterDN(const SSLX509Name& fullClusterDN,
+                            const stdx::unordered_set<std::string>& filterAttributes);
 
 /**
  * Parse a DN from a string per RFC 4514

@@ -33,6 +33,8 @@
 #include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_update_delete_util.h"
 #include "mongo/db/transaction/transaction_api.h"
 #include "mongo/db/update/update_util.h"
 #include "mongo/logv2/log.h"
@@ -198,16 +200,27 @@ bool useTwoPhaseProtocol(OperationContext* opCtx,
     auto hasDefaultCollation =
         CollatorInterface::collatorsMatch(collator.get(), cm.getDefaultCollator());
 
+    auto tsFields = cm.getTimeseriesFields();
+    bool isTimeseries = tsFields.has_value();
+
     // updateOne and deleteOne do not use the two phase protocol for single writes that specify
     // _id in their queries, unless a document is being upserted. An exact _id match requires
     // default collation if the _id value is a collatable type.
     if (isUpdateOrDelete && query.hasField("_id") &&
-        isExactIdQuery(opCtx, nss, query, collation, hasDefaultCollation) && !isUpsert) {
+        isExactIdQuery(opCtx, nss, query, collation, hasDefaultCollation) && !isUpsert &&
+        !isTimeseries) {
         return false;
     }
 
-    auto shardKey =
-        uassertStatusOK(extractShardKeyFromBasicQuery(opCtx, nss, cm.getShardKeyPattern(), query));
+    BSONObj deleteQuery = query;
+    if (isTimeseries) {
+        auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), nss);
+        deleteQuery =
+            timeseries::getBucketLevelPredicateForRouting(query, expCtx, tsFields->getMetaField());
+    }
+
+    auto shardKey = uassertStatusOK(
+        extractShardKeyFromBasicQuery(opCtx, nss, cm.getShardKeyPattern(), deleteQuery));
 
     // 'shardKey' will only be populated only if a full equality shard key is extracted.
     if (shardKey.isEmpty()) {
@@ -245,19 +258,24 @@ StatusWith<ClusterWriteWithoutShardKeyResponse> runTwoPhaseWriteProtocol(Operati
         ClusterWriteWithoutShardKeyResponse clusterWriteResponse;
     };
 
-    auto txn = txn_api::SyncTransactionWithRetries(
-        opCtx,
-        Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        TransactionRouterResourceYielder::makeForLocalHandoff());
+    auto& executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
+    auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
+    auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
+
+    auto txn =
+        txn_api::SyncTransactionWithRetries(opCtx,
+                                            sleepInlineExecutor,
+                                            TransactionRouterResourceYielder::makeForLocalHandoff(),
+                                            inlineExecutor);
 
     auto sharedBlock = std::make_shared<SharedBlock>(nss, cmdObj);
     auto swResult = txn.runNoThrow(
         opCtx, [sharedBlock](const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
             ClusterQueryWithoutShardKey clusterQueryWithoutShardKeyCommand(sharedBlock->cmdObj);
-            auto queryRes = txnClient
-                                .runCommand(sharedBlock->nss.dbName(),
-                                            clusterQueryWithoutShardKeyCommand.toBSON({}))
-                                .get();
+
+            auto queryRes = txnClient.runCommandSync(sharedBlock->nss.dbName(),
+                                                     clusterQueryWithoutShardKeyCommand.toBSON({}));
+
             uassertStatusOK(getStatusFromCommandResult(queryRes));
 
             ClusterQueryWithoutShardKeyResponse queryResponse =
@@ -276,9 +294,8 @@ StatusWith<ClusterWriteWithoutShardKeyResponse> runTwoPhaseWriteProtocol(Operati
                 docs.push_back(queryResponse.getTargetDoc().get());
                 write_ops::InsertCommandRequest insertRequest(sharedBlock->nss, docs);
 
-                auto writeRes =
-                    txnClient.runCRUDOp(insertRequest, std::vector<StmtId>{kUninitializedStmtId})
-                        .get();
+                auto writeRes = txnClient.runCRUDOpSync(insertRequest,
+                                                        std::vector<StmtId>{kUninitializedStmtId});
 
                 auto upsertResponse =
                     constructUpsertResponse(writeRes,
@@ -297,10 +314,8 @@ StatusWith<ClusterWriteWithoutShardKeyResponse> runTwoPhaseWriteProtocol(Operati
                     *queryResponse.getTargetDoc() /* targetDocId */);
 
                 auto writeRes =
-                    txnClient
-                        .runCommand(sharedBlock->nss.dbName(),
-                                    clusterWriteWithoutShardKeyCommand.toBSON(BSONObj()))
-                        .get();
+                    txnClient.runCommandSync(sharedBlock->nss.dbName(),
+                                             clusterWriteWithoutShardKeyCommand.toBSON(BSONObj()));
                 uassertStatusOK(getStatusFromCommandResult(writeRes));
 
                 sharedBlock->clusterWriteResponse = ClusterWriteWithoutShardKeyResponse::parseOwned(
